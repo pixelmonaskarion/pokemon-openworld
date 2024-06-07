@@ -1,0 +1,45 @@
+[package]
+name = "pokemon-openworld"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.80"
+bytemuck = { version = "1.14.3", features=["derive"] }
+cgmath = "0.18.0"
+env_logger = "0.11.2"
+image = "0.25.0"
+tokio = { version = "1.36.0", features = ["full"] }
+wgpu = "0.20.0"
+wgpu_text = "0.8.8"
+bespoke-engine = { path = "../bespoke-engine" }
+log = "0.4.21"
+load_file = "1.0.1"
+phf = { version = "0.11.1", default-features = false }
+
+[build-dependencies]
+bespoke-engine = { path = "../bespoke-engine" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.13.3"
+winit = { version = "0.30.0", features = ["android-game-activity"] }
+pollster = "0.3.0"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+winit = "0.30.0"
+
+[lib]
+name = "main"
+crate-type = ["cdylib"]
+path = "src/android.rs"
+
+[[bin]]
+name = "pokemon-openworld"
+path = "src/desktop.rs"
+
+# [package.metadata.android]
+# build_targets = ["armv7-linux-androideabi", "aarch64-linux-android"]
+# target_sdk_version = 29
+# min_sdk_version = 23
