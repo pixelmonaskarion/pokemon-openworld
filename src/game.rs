@@ -1,18 +1,18 @@
-use std::{collections::HashMap, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, f32::consts::PI, time::{SystemTime, UNIX_EPOCH}};
 
-use bespoke_engine::{binding::{Descriptor, UniformBinding}, camera::Camera, instance::Instance, model::{Render, ToRaw}, shader::{Shader, ShaderConfig}, surface_context::SurfaceCtx, texture::Texture, window::{WindowConfig, WindowHandler}};
+use bespoke_engine::{binding::{create_layout, Descriptor, UniformBinding}, camera::Camera, instance::Instance, model::{Render, ToRaw}, shader::{Shader, ShaderConfig}, surface_context::SurfaceCtx, texture::{DepthTexture, Texture}, window::{BasicVertex, WindowConfig, WindowHandler}};
 use bytemuck::{bytes_of, NoUninit};
 use cgmath::{Vector2, Vector3};
-use wgpu::{Limits, RenderPass};
+use wgpu::{Limits, RenderPass, RenderPassDescriptor};
 use winit::{dpi::PhysicalPosition, event::{KeyEvent, TouchPhase}, keyboard::{KeyCode, PhysicalKey::Code}};
 
 use crate::{height_map::HeightMap, load_resource, water::Water};
 
 pub struct Game {
-    camera_binding: UniformBinding<[[f32; 4]; 4]>,
-    camera_inverse_binding: UniformBinding<[[f32; 4]; 4]>,
+    camera_binding: UniformBinding<Camera>,
     camera_pos_binding: UniformBinding<[f32; 3]>,
     camera: Camera,
+    sun_camera_binding: UniformBinding<Camera>,
     screen_size: [f32; 2],
     screen_info_binding: UniformBinding<[f32; 4]>,
     time_binding: UniformBinding<f32>,
@@ -20,10 +20,13 @@ pub struct Game {
     keys_down: Vec<KeyCode>,
     height_map: HeightMap,
     ground_shader: Shader,
+    ground_shader_depth: Shader,
     touch_positions: HashMap<u64, PhysicalPosition<f64>>,
     moving_bc_finger: Option<u64>,
     water_shader: Shader,
     water: Water,
+    shadow_texture: UniformBinding<DepthTexture>,
+    depth_renderer_shader: Shader,
 }
 
 #[repr(C)]
@@ -94,19 +97,22 @@ impl Game {
             ground: 0.0,
             sky: 0.0,
         };
-        let camera_binding = UniformBinding::new(surface_context.device(), "Camera", camera.build_view_projection_matrix_raw(), None);
-        let camera_inverse_binding = UniformBinding::new(surface_context.device(), "Camera Inverse", camera.build_inverse_matrix_raw(), None);
+        let camera_binding = UniformBinding::new(surface_context.device(), "Camera", camera.clone(), None);
         let camera_pos_binding = UniformBinding::new(surface_context.device(), "Camera Position", Into::<[f32; 3]>::into(camera.eye), None);
         let time_binding = UniformBinding::new(surface_context.device(), "Time", 0.0_f32, None);
         let start_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
-        let ground_shader = Shader::new(include_str!("ground.wgsl"), surface_context.device(), surface_context.config().format, vec![&camera_binding.layout, &time_binding.layout], &[crate::height_map::Vertex::desc(), Instance::desc()], Some(ShaderConfig {line_mode: Some(wgpu::PolygonMode::Fill), ..Default::default()}));
-        let water_shader = Shader::new(include_str!("water.wgsl"), surface_context.device(), surface_context.config().format, vec![&camera_binding.layout, &time_binding.layout], &[Vertex::desc(), Instance::desc()], Some(ShaderConfig {background: Some(false), ..Default::default()}));
+        let ground_shader = Shader::new(include_str!("ground.wgsl"), surface_context.device(), surface_context.config().format, vec![&camera_binding.layout, &time_binding.layout], &[crate::height_map::Vertex::desc(), Instance::desc()], ShaderConfig {line_mode: wgpu::PolygonMode::Fill, ..Default::default()});
+        let ground_shader_depth = Shader::new(include_str!("ground.wgsl"), surface_context.device(), surface_context.config().format, vec![&camera_binding.layout, &time_binding.layout], &[crate::height_map::Vertex::desc(), Instance::desc()], ShaderConfig {line_mode: wgpu::PolygonMode::Fill, depth_only: true, ..Default::default()});
+        let water_shader = Shader::new(include_str!("water.wgsl"), surface_context.device(), surface_context.config().format, vec![&camera_binding.layout, &time_binding.layout], &[Vertex::desc(), Instance::desc()], ShaderConfig {background: false, ..Default::default()});
         let water = Water::new(surface_context.device(), height_map.width.max(height_map.height) as f32, 100.0);
+        let shadow_texture = UniformBinding::new(surface_context.device(), "Shadow Depth Texture", DepthTexture::create_depth_texture(surface_context.device(), surface_context.config().width, surface_context.config().height, "Shadows Depth texture"), None);
+        let depth_renderer_shader = Shader::new(include_str!("depth_renderer.wgsl"), surface_context.device(), surface_context.config().format, vec![&create_layout::<DepthTexture>(surface_context.device()), &create_layout::<DepthTexture>(surface_context.device()), &screen_info_binding.layout, &camera_binding.layout, &camera_binding.layout], &[BasicVertex::desc()], ShaderConfig {enable_depth_texture: false, ..Default::default()});
+        let sun_camera_binding = UniformBinding::new(surface_context.device(), "Sun Camera", camera.clone(), None);
         Self {
             camera_binding,
-            camera_inverse_binding,
             camera_pos_binding,
             camera,
+            sun_camera_binding,
             screen_size,
             screen_info_binding,
             time_binding,
@@ -114,10 +120,67 @@ impl Game {
             keys_down: vec![],
             height_map,
             ground_shader,
+            ground_shader_depth,
             touch_positions: HashMap::new(),
             moving_bc_finger: None,
             water,
             water_shader,
+            shadow_texture,
+            depth_renderer_shader,
+        }
+    }
+
+    fn render_shadows(&mut self, surface_ctx: &dyn SurfaceCtx) {
+        let shadow_texture = DepthTexture::create_depth_texture(surface_ctx.device(), surface_ctx.config().width, surface_ctx.config().height, "Shadows Depth texture");
+        let mut encoder = surface_ctx.device().create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: None,
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &shadow_texture.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.sun_camera_binding.set_data(surface_ctx.device(), self.sun_camera());
+            if self.height_map.models.is_some() {
+                self.camera_pos_binding.set_data(surface_ctx.device(), Into::<[f32; 3]>::into(self.sun_camera_binding.value.eye));
+                let time = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()-self.start_time) as f32 / 1000.0;
+                self.time_binding.set_data(surface_ctx.device(), time);
+                self.screen_info_binding.set_data(surface_ctx.device(), [self.screen_size[0], self.screen_size[1], time, 0.0]);
+    
+                render_pass.set_pipeline(&self.ground_shader_depth.pipeline);
+                
+                render_pass.set_bind_group(0, &self.sun_camera_binding.binding, &[]);
+                render_pass.set_bind_group(1, &self.time_binding.binding, &[]);
+                
+                self.height_map.render(&mut render_pass);
+            } else {
+                self.height_map.create_models(surface_ctx.device());
+            }
+        }
+        surface_ctx.queue().submit([encoder.finish()]);
+        self.shadow_texture.set_data(surface_ctx.device(), shadow_texture);
+    }
+
+    fn sun_camera(&self) -> Camera {
+        let sun_pos = Vector3::new(self.height_map.width as f32 * 1.01, 900.0, self.height_map.width as f32 * 1.01);
+        let look_pos = sun_pos-Vector3::new(self.height_map.width as f32 * 0.5, 0.0, self.height_map.height as f32 * 0.5);
+        let dist = (look_pos.x.powi(2)+look_pos.z.powi(2)).sqrt();
+        Camera {
+            eye: sun_pos,
+            aspect: self.screen_size[0] / self.screen_size[1],
+            fovy: 100.0,
+            znear: 1.0,
+            zfar: 1000.0,
+            ground: (look_pos.z/look_pos.x).atan()+PI*((look_pos.x.abs()/look_pos.x)-1.0) + PI,
+            sky: -(look_pos.y/dist).atan(),
         }
     }
 }
@@ -129,29 +192,32 @@ impl WindowHandler for Game {
     }
 
     fn render<'a: 'b, 'b>(&'a mut self, surface_ctx: &dyn SurfaceCtx, render_pass: & mut RenderPass<'b>, delta: f64) {
+        let speed = 2.0 * delta as f32;
+        // self.camera.ground = (self.camera.eye.z/self.camera.eye.x).atan()+PI*(self.camera.eye.x.abs()/self.camera.eye.x-1.0) + PI;
+        // let dist = (self.camera.eye.x.powi(2)+self.camera.eye.z.powi(2)).sqrt();
+        // self.camera.sky = -(self.camera.eye.y/dist).atan();
+        if self.keys_down.contains(&KeyCode::KeyW) || self.moving_bc_finger.is_some() {
+            self.camera.eye += self.camera.get_walking_vec() * speed;
+        }
+        if self.keys_down.contains(&KeyCode::KeyS) {
+            self.camera.eye -= self.camera.get_walking_vec() * speed;
+        }
+        if self.keys_down.contains(&KeyCode::KeyA) {
+            self.camera.eye -= self.camera.get_right_vec() * speed;
+        }
+        if self.keys_down.contains(&KeyCode::KeyD) {
+            self.camera.eye += self.camera.get_right_vec() * speed;
+        }
+        if self.keys_down.contains(&KeyCode::Space) {
+            self.camera.eye += Vector3::unit_y() * speed;
+        }
+        if self.keys_down.contains(&KeyCode::ShiftLeft) {
+            self.camera.eye -= Vector3::unit_y() * speed;
+        }
+        // self.camera.eye.y = self.height_map.get_height_at(self.camera.eye.x, self.camera.eye.z)+2.0;
+        self.render_shadows(surface_ctx);
         if self.height_map.models.is_some() {
-            let speed = 0.2 * delta as f32;
-            if self.keys_down.contains(&KeyCode::KeyW) || self.moving_bc_finger.is_some() {
-                self.camera.eye += self.camera.get_walking_vec() * speed;
-            }
-            if self.keys_down.contains(&KeyCode::KeyS) {
-                self.camera.eye -= self.camera.get_walking_vec() * speed;
-            }
-            if self.keys_down.contains(&KeyCode::KeyA) {
-                self.camera.eye -= self.camera.get_right_vec() * speed;
-            }
-            if self.keys_down.contains(&KeyCode::KeyD) {
-                self.camera.eye += self.camera.get_right_vec() * speed;
-            }
-            if self.keys_down.contains(&KeyCode::Space) {
-                self.camera.eye += Vector3::unit_y() * speed;
-            }
-            if self.keys_down.contains(&KeyCode::ShiftLeft) {
-                self.camera.eye -= Vector3::unit_y() * speed;
-            }
-            // self.camera.eye.y = self.height_map.get_height_at(self.camera.eye.x, self.camera.eye.z)+2.0;
-            self.camera_binding.set_data(surface_ctx.device(), self.camera.build_view_projection_matrix_raw());
-            self.camera_inverse_binding.set_data(surface_ctx.device(), self.camera.build_inverse_matrix_raw());
+            self.camera_binding.set_data(surface_ctx.device(), self.camera.clone());
             self.camera_pos_binding.set_data(surface_ctx.device(), Into::<[f32; 3]>::into(self.camera.eye));
             let time = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()-self.start_time) as f32 / 1000.0;
             self.time_binding.set_data(surface_ctx.device(), time);
@@ -173,7 +239,7 @@ impl WindowHandler for Game {
     }
 
     fn config(&self) -> Option<WindowConfig> {
-        Some(WindowConfig { background_color: None, enable_post_processing: Some(false) })
+        Some(WindowConfig { background_color: None, enable_post_processing: Some(true) })
     }
 
     fn mouse_moved(&mut self, _surface_ctx: &dyn SurfaceCtx, _mouse_pos: PhysicalPosition<f64>) {
@@ -225,11 +291,15 @@ impl WindowHandler for Game {
         }
     }
     
-    fn post_process_render<'a: 'b, 'c: 'b, 'b>(&'a mut self, _surface_ctx: &dyn SurfaceCtx, _render_pass: & mut RenderPass<'b>, _surface_texture: &'c UniformBinding<Texture>) {
-        //post processing is disabled
-        // render_pass.set_pipeline(&self.post_processing_shader.pipeline);
+    fn post_process_render<'a: 'b, 'c: 'b, 'b>(&'a mut self, surface_ctx: &'c dyn SurfaceCtx, render_pass: & mut RenderPass<'b>, _surface_texture: &'c UniformBinding<Texture>) {
+        render_pass.set_pipeline(&self.depth_renderer_shader.pipeline);
+        render_pass.set_bind_group(0, &self.shadow_texture.binding, &[]);
+        render_pass.set_bind_group(1, &surface_ctx.depth_texture().binding, &[]);
+        render_pass.set_bind_group(2, &self.screen_info_binding.binding, &[]);
+        render_pass.set_bind_group(3, &self.camera_binding.binding, &[]);
+        render_pass.set_bind_group(4, &self.sun_camera_binding.binding, &[]);
 
-        // screen_model.render(render_pass);
+        surface_ctx.screen_model().render(render_pass);
     }
     
     fn limits() -> wgpu::Limits {

@@ -1,4 +1,9 @@
-@group(0) @binding(0) var<uniform> camera: mat4x4<f32>;
+struct Camera {
+    projection: mat4x4<f32>,
+    inverse: mat4x4<f32>,
+}
+
+@group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var<uniform> time: f32;
 
 struct VertexInput {
@@ -30,7 +35,7 @@ fn vs_main(
         instance.model_matrix_3,
     );
     var out: VertexOutput;
-    out.clip_position = camera * model_matrix * vec4f(model.position, 1.0);
+    out.clip_position = camera.projection * model_matrix * vec4f(model.position, 1.0);
     out.tex_pos = model.tex_pos;
     return out;
 }
